@@ -1,17 +1,16 @@
-const { poolPromise, sql } = require('../config/db')
+const pool = require('../config/db')
 
 // GET /api/group
 const getGroup = async (req, res, next) => {
   try {
-    const pool = await poolPromise
-    const result = await pool.request()
-      .input('groupId', sql.Int, req.user.groupId)
-      .query('SELECT * FROM Groups WHERE group_id = @groupId')
-
-    if (result.recordset.length === 0)
+    const result = await pool.query(
+      'SELECT * FROM groups WHERE group_id = $1',
+      [req.user.groupId]
+    )
+    if (result.rows.length === 0)
       return res.status(404).json({ message: 'Group not found.' })
 
-    res.json(result.recordset[0])
+    res.json(result.rows[0])
   } catch (err) {
     next(err)
   }
@@ -21,24 +20,22 @@ const getGroup = async (req, res, next) => {
 const updateGroup = async (req, res, next) => {
   try {
     const { name, description, target_amount } = req.body
-    const pool = await poolPromise
 
-    await pool.request()
-      .input('groupId',      sql.Int,      req.user.groupId)
-      .input('name',         sql.NVarChar, name || null)
-      .input('description',  sql.NVarChar, description || null)
-      .input('targetAmount', sql.Decimal,  target_amount || null)
-      .query(`UPDATE Groups SET
-                name          = ISNULL(@name,         name),
-                description   = ISNULL(@description,  description),
-                target_amount = ISNULL(@targetAmount,  target_amount)
-              WHERE group_id = @groupId`)
+    await pool.query(
+      `UPDATE groups SET
+         name          = COALESCE($1, name),
+         description   = COALESCE($2, description),
+         target_amount = COALESCE($3, target_amount)
+       WHERE group_id = $4`,
+      [name || null, description || null, target_amount || null, req.user.groupId]
+    )
 
-    const updated = await pool.request()
-      .input('groupId', sql.Int, req.user.groupId)
-      .query('SELECT * FROM Groups WHERE group_id = @groupId')
+    const updated = await pool.query(
+      'SELECT * FROM groups WHERE group_id = $1',
+      [req.user.groupId]
+    )
 
-    res.json(updated.recordset[0])
+    res.json(updated.rows[0])
   } catch (err) {
     next(err)
   }

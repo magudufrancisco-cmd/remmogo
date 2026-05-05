@@ -1,8 +1,7 @@
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
-const { poolPromise, sql } = require('../config/db')
+const pool = require('../config/db')
 
-// Helper: sign a token
 const signToken = (user) =>
   jwt.sign(
     { id: user.member_id, name: user.name, email: user.email, role: user.role, groupId: user.group_id },
@@ -11,44 +10,32 @@ const signToken = (user) =>
   )
 
 // POST /api/auth/register
-// Registers the FIRST member of a new group (and creates the group).
-// Subsequent members are added by signatories via /api/members.
 const register = async (req, res, next) => {
   try {
     const { groupName, name, email, password, phone } = req.body
     if (!groupName || !name || !email || !password)
       return res.status(400).json({ message: 'All fields are required.' })
 
-    const pool = await poolPromise
-
-    // Check email not already taken
-    const existing = await pool.request()
-      .input('email', sql.NVarChar, email)
-      .query('SELECT member_id FROM Members WHERE email = @email')
-    if (existing.recordset.length > 0)
+    const existing = await pool.query('SELECT member_id FROM members WHERE email = $1', [email])
+    if (existing.rows.length > 0)
       return res.status(409).json({ message: 'Email already registered.' })
 
     const hash = await bcrypt.hash(password, 12)
 
-    // Create group
-    const groupResult = await pool.request()
-      .input('name', sql.NVarChar, groupName)
-      .query('INSERT INTO Groups (name) OUTPUT INSERTED.group_id VALUES (@name)')
-    const groupId = groupResult.recordset[0].group_id
+    const groupResult = await pool.query(
+      'INSERT INTO groups (name) VALUES ($1) RETURNING group_id',
+      [groupName]
+    )
+    const groupId = groupResult.rows[0].group_id
 
-    // Create first member as signatory
-    const memberResult = await pool.request()
-      .input('groupId', sql.Int, groupId)
-      .input('name',    sql.NVarChar, name)
-      .input('email',   sql.NVarChar, email)
-      .input('phone',   sql.NVarChar, phone || null)
-      .input('password',sql.NVarChar, hash)
-      .input('role',    sql.NVarChar, 'signatory')
-      .query(`INSERT INTO Members (group_id, name, email, phone, password, role)
-              OUTPUT INSERTED.*
-              VALUES (@groupId, @name, @email, @phone, @password, @role)`)
+    const memberResult = await pool.query(
+      `INSERT INTO members (group_id, name, email, phone, password, role)
+       VALUES ($1, $2, $3, $4, $5, 'signatory')
+       RETURNING *`,
+      [groupId, name, email, phone || null, hash]
+    )
 
-    const user = memberResult.recordset[0]
+    const user = memberResult.rows[0]
     const token = signToken(user)
 
     res.status(201).json({
@@ -67,18 +54,18 @@ const login = async (req, res, next) => {
     if (!email || !password)
       return res.status(400).json({ message: 'Email and password are required.' })
 
-    const pool = await poolPromise
-    const result = await pool.request()
-      .input('email', sql.NVarChar, email)
-      .query(`SELECT m.*, g.name AS group_name
-              FROM Members m
-              JOIN Groups g ON g.group_id = m.group_id
-              WHERE m.email = @email`)
+    const result = await pool.query(
+      `SELECT m.*, g.name AS group_name
+       FROM members m
+       JOIN groups g ON g.group_id = m.group_id
+       WHERE m.email = $1`,
+      [email]
+    )
 
-    if (result.recordset.length === 0)
+    if (result.rows.length === 0)
       return res.status(401).json({ message: 'Invalid email or password.' })
 
-    const user = result.recordset[0]
+    const user = result.rows[0]
     const valid = await bcrypt.compare(password, user.password)
     if (!valid)
       return res.status(401).json({ message: 'Invalid email or password.' })

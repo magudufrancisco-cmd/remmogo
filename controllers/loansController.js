@@ -1,63 +1,34 @@
-const { poolPromise, sql } = require('../config/db')
-
-const INTEREST_RATE = 0.20  // 20% monthly
-
-// Helper: build a loan object with its payments
-const fetchLoanWithPayments = async (pool, loanId, groupId) => {
-  const loan = await pool.request()
-    .input('loanId',  sql.Int, loanId)
-    .input('groupId', sql.Int, groupId)
-    .query(`SELECT l.*, m.name AS memberName,
-                   (SELECT COUNT(*) FROM Approvals
-                    WHERE entity_type='loan' AND entity_id=l.loan_id) AS approvalCount
-            FROM Loans l
-            JOIN Members m ON m.member_id = l.member_id
-            WHERE l.loan_id = @loanId AND l.group_id = @groupId`)
-
-  if (loan.recordset.length === 0) return null
-
-  const payments = await pool.request()
-    .input('loanId', sql.Int, loanId)
-    .query(`SELECT lp.payment_id AS id, lp.amount, lp.proof_url AS proofUrl,
-                   lp.status, lp.submitted_at AS date,
-                   (SELECT COUNT(*) FROM Approvals
-                    WHERE entity_type='loan_payment' AND entity_id=lp.payment_id) AS approvalCount
-            FROM LoanPayments lp
-            WHERE lp.loan_id = @loanId
-            ORDER BY lp.submitted_at DESC`)
-
-  return { ...loan.recordset[0], payments: payments.recordset }
-}
+const pool = require('../config/db')
 
 // GET /api/loans
 const getLoans = async (req, res, next) => {
   try {
-    const pool = await poolPromise
-    const result = await pool.request()
-      .input('groupId', sql.Int, req.user.groupId)
-      .query(`SELECT l.loan_id AS id, l.member_id, m.name AS memberName,
-                     l.principal, l.balance, l.interest_rate AS interestRate,
-                     ROUND(l.balance * l.interest_rate, 2) AS interestDue,
-                     l.reason, l.status, l.date_taken AS dateTaken,
-                     l.disbursed_at AS disbursedAt,
-                     (SELECT COUNT(*) FROM Approvals
-                      WHERE entity_type='loan' AND entity_id=l.loan_id) AS approvalCount
-              FROM Loans l
-              JOIN Members m ON m.member_id = l.member_id
-              WHERE l.group_id = @groupId
-              ORDER BY l.created_at DESC`)
+    const result = await pool.query(
+      `SELECT l.loan_id AS id, l.member_id, m.name AS "memberName",
+              l.principal, l.balance, l.interest_rate AS "interestRate",
+              ROUND(l.balance * l.interest_rate, 2) AS "interestDue",
+              l.reason, l.status, l.date_taken AS "dateTaken",
+              l.disbursed_at AS "disbursedAt",
+              (SELECT COUNT(*) FROM approvals
+               WHERE entity_type='loan' AND entity_id=l.loan_id) AS "approvalCount"
+       FROM loans l
+       JOIN members m ON m.member_id = l.member_id
+       WHERE l.group_id = $1
+       ORDER BY l.created_at DESC`,
+      [req.user.groupId]
+    )
 
-    // Attach payments to each loan
     const loans = await Promise.all(
-      result.recordset.map(async (loan) => {
-        const payments = await pool.request()
-          .input('loanId', sql.Int, loan.id)
-          .query(`SELECT payment_id AS id, amount, proof_url AS proofUrl,
-                         status, submitted_at AS date,
-                         (SELECT COUNT(*) FROM Approvals
-                          WHERE entity_type='loan_payment' AND entity_id=payment_id) AS approvalCount
-                  FROM LoanPayments WHERE loan_id = @loanId ORDER BY submitted_at DESC`)
-        return { ...loan, payments: payments.recordset }
+      result.rows.map(async (loan) => {
+        const payments = await pool.query(
+          `SELECT payment_id AS id, amount, proof_url AS "proofUrl",
+                  status, submitted_at AS date,
+                  (SELECT COUNT(*) FROM approvals
+                   WHERE entity_type='loan_payment' AND entity_id=payment_id) AS "approvalCount"
+           FROM loan_payments WHERE loan_id = $1 ORDER BY submitted_at DESC`,
+          [loan.id]
+        )
+        return { ...loan, payments: payments.rows }
       })
     )
 
@@ -67,90 +38,77 @@ const getLoans = async (req, res, next) => {
   }
 }
 
-// POST /api/loans  — member applies for a loan
+// POST /api/loans
 const applyLoan = async (req, res, next) => {
   try {
     const { principal, reason } = req.body
     if (!principal || principal < 1)
       return res.status(400).json({ message: 'Enter a valid principal amount.' })
 
-    const pool = await poolPromise
-
     // Only one active loan per member
-    const active = await pool.request()
-      .input('memberId', sql.Int, req.user.id)
-      .query(`SELECT loan_id FROM Loans
-              WHERE member_id = @memberId AND status NOT IN ('rejected','fully_paid')`)
-    if (active.recordset.length > 0)
+    const active = await pool.query(
+      `SELECT loan_id FROM loans
+       WHERE member_id = $1 AND status NOT IN ('rejected','fully_paid')`,
+      [req.user.id]
+    )
+    if (active.rows.length > 0)
       return res.status(400).json({ message: 'You already have an active loan.' })
 
-    const result = await pool.request()
-      .input('memberId',  sql.Int,      req.user.id)
-      .input('groupId',   sql.Int,      req.user.groupId)
-      .input('principal', sql.Decimal,  principal)
-      .input('balance',   sql.Decimal,  principal)
-      .input('reason',    sql.NVarChar, reason || null)
-      .query(`INSERT INTO Loans (member_id, group_id, principal, balance, reason)
-              OUTPUT INSERTED.loan_id AS id, INSERTED.member_id, INSERTED.principal,
-                     INSERTED.balance, INSERTED.status, INSERTED.date_taken AS dateTaken
-              VALUES (@memberId, @groupId, @principal, @balance, @reason)`)
+    const result = await pool.query(
+      `INSERT INTO loans (member_id, group_id, principal, balance, reason)
+       VALUES ($1, $2, $3, $3, $4)
+       RETURNING loan_id AS id, member_id, principal, balance, status, date_taken AS "dateTaken"`,
+      [req.user.id, req.user.groupId, principal, reason || null]
+    )
 
-    res.status(201).json({ ...result.recordset[0], payments: [] })
+    res.status(201).json({ ...result.rows[0], payments: [] })
   } catch (err) {
     next(err)
   }
 }
 
-// PATCH /api/loans/:id/approve  (signatories only)
-// First approval → records it and returns "awaiting 2nd".
-// Second approval → marks loan as approved and sets disbursed_at.
+// PATCH /api/loans/:id/approve
 const approveLoan = async (req, res, next) => {
   try {
     const { id } = req.params
-    const pool = await poolPromise
 
-    const loanResult = await pool.request()
-      .input('loanId',  sql.Int, id)
-      .input('groupId', sql.Int, req.user.groupId)
-      .query('SELECT * FROM Loans WHERE loan_id = @loanId AND group_id = @groupId')
-
-    if (loanResult.recordset.length === 0)
+    const loanResult = await pool.query(
+      `SELECT * FROM loans WHERE loan_id = $1 AND group_id = $2`,
+      [id, req.user.groupId]
+    )
+    if (loanResult.rows.length === 0)
       return res.status(404).json({ message: 'Loan not found.' })
 
-    const loan = loanResult.recordset[0]
+    const loan = loanResult.rows[0]
     if (loan.status !== 'pending')
       return res.status(400).json({ message: `Loan is already ${loan.status}.` })
 
     // Check if this signatory already approved
-    const alreadyApproved = await pool.request()
-      .input('loanId',      sql.Int, id)
-      .input('signatoryId', sql.Int, req.user.id)
-      .query(`SELECT approval_id FROM Approvals
-              WHERE entity_type='loan' AND entity_id=@loanId AND signatory_id=@signatoryId`)
-    if (alreadyApproved.recordset.length > 0)
+    const alreadyApproved = await pool.query(
+      `SELECT approval_id FROM approvals
+       WHERE entity_type='loan' AND entity_id=$1 AND signatory_id=$2`,
+      [id, req.user.id]
+    )
+    if (alreadyApproved.rows.length > 0)
       return res.status(400).json({ message: 'You have already approved this loan.' })
 
-    // Insert approval
-    await pool.request()
-      .input('loanId',      sql.Int,     id)
-      .input('signatoryId', sql.Int,     req.user.id)
-      .query(`INSERT INTO Approvals (entity_type, entity_id, signatory_id)
-              VALUES ('loan', @loanId, @signatoryId)`)
+    await pool.query(
+      `INSERT INTO approvals (entity_type, entity_id, signatory_id)
+       VALUES ('loan', $1, $2)`,
+      [id, req.user.id]
+    )
 
-    // Count total approvals
-    const countResult = await pool.request()
-      .input('loanId', sql.Int, id)
-      .query(`SELECT COUNT(*) AS total FROM Approvals
-              WHERE entity_type='loan' AND entity_id=@loanId`)
-
-    const total = countResult.recordset[0].total
+    const countResult = await pool.query(
+      `SELECT COUNT(*) AS total FROM approvals WHERE entity_type='loan' AND entity_id=$1`,
+      [id]
+    )
+    const total = parseInt(countResult.rows[0].total)
 
     if (total >= 2) {
-      await pool.request()
-        .input('loanId', sql.Int, id)
-        .query(`UPDATE Loans
-                SET status='approved', disbursed_at=GETDATE()
-                WHERE loan_id = @loanId`)
+      await pool.query(
+        `UPDATE loans SET status='approved', disbursed_at=NOW() WHERE loan_id=$1`,
+        [id]
+      )
       return res.json({ message: 'Loan approved and disbursed. Both signatories signed off.', approved: true })
     }
 
@@ -160,25 +118,21 @@ const approveLoan = async (req, res, next) => {
   }
 }
 
-// PATCH /api/loans/:id/reject  (signatories only)
+// PATCH /api/loans/:id/reject
 const rejectLoan = async (req, res, next) => {
   try {
     const { id } = req.params
-    const pool = await poolPromise
 
-    const existing = await pool.request()
-      .input('loanId', sql.Int, id)
-      .input('groupId', sql.Int, req.user.groupId)
-      .query('SELECT * FROM Loans WHERE loan_id = @loanId AND group_id = @groupId')
-
-    if (existing.recordset.length === 0)
+    const existing = await pool.query(
+      `SELECT * FROM loans WHERE loan_id = $1 AND group_id = $2`,
+      [id, req.user.groupId]
+    )
+    if (existing.rows.length === 0)
       return res.status(404).json({ message: 'Loan not found.' })
-    if (existing.recordset[0].status !== 'pending')
+    if (existing.rows[0].status !== 'pending')
       return res.status(400).json({ message: 'Only pending loans can be rejected.' })
 
-    await pool.request()
-      .input('loanId', sql.Int, id)
-      .query(`UPDATE Loans SET status='rejected' WHERE loan_id=@loanId`)
+    await pool.query(`UPDATE loans SET status='rejected' WHERE loan_id=$1`, [id])
 
     res.json({ message: 'Loan rejected.' })
   } catch (err) {
@@ -186,9 +140,7 @@ const rejectLoan = async (req, res, next) => {
   }
 }
 
-// --- LOAN PAYMENTS ---
-
-// POST /api/loans/:id/payments  — member records a repayment
+// POST /api/loans/:id/payments
 const addPayment = async (req, res, next) => {
   try {
     const { id } = req.params
@@ -196,103 +148,86 @@ const addPayment = async (req, res, next) => {
     if (!amount || amount < 1)
       return res.status(400).json({ message: 'Enter a valid payment amount.' })
 
-    const pool = await poolPromise
-    const loanResult = await pool.request()
-      .input('loanId',  sql.Int, id)
-      .input('groupId', sql.Int, req.user.groupId)
-      .query('SELECT * FROM Loans WHERE loan_id = @loanId AND group_id = @groupId')
-
-    if (loanResult.recordset.length === 0)
+    const loanResult = await pool.query(
+      `SELECT * FROM loans WHERE loan_id = $1 AND group_id = $2`,
+      [id, req.user.groupId]
+    )
+    if (loanResult.rows.length === 0)
       return res.status(404).json({ message: 'Loan not found.' })
-
-    const loan = loanResult.recordset[0]
-    if (loan.status !== 'approved')
+    if (loanResult.rows[0].status !== 'approved')
       return res.status(400).json({ message: 'Cannot pay a loan that is not approved.' })
 
-    const result = await pool.request()
-      .input('loanId',   sql.Int,     id)
-      .input('memberId', sql.Int,     req.user.id)
-      .input('amount',   sql.Decimal, amount)
-      .input('proofUrl', sql.NVarChar, proof_url || null)
-      .query(`INSERT INTO LoanPayments (loan_id, member_id, amount, proof_url)
-              OUTPUT INSERTED.payment_id AS id, INSERTED.amount,
-                     INSERTED.status, INSERTED.submitted_at AS date
-              VALUES (@loanId, @memberId, @amount, @proofUrl)`)
+    const result = await pool.query(
+      `INSERT INTO loan_payments (loan_id, member_id, amount, proof_url)
+       VALUES ($1, $2, $3, $4)
+       RETURNING payment_id AS id, amount, status, submitted_at AS date`,
+      [id, req.user.id, amount, proof_url || null]
+    )
 
-    res.status(201).json({ ...result.recordset[0], approvalCount: 0 })
+    res.status(201).json({ ...result.rows[0], approvalCount: 0 })
   } catch (err) {
     next(err)
   }
 }
 
-// PATCH /api/loans/payments/:paymentId/approve  (signatories only)
-// Second approval deducts from loan balance; if balance ≤ 0 → fully_paid
+// PATCH /api/loans/payments/:paymentId/approve
 const approvePayment = async (req, res, next) => {
   try {
     const { paymentId } = req.params
-    const pool = await poolPromise
 
-    const payResult = await pool.request()
-      .input('paymentId', sql.Int, paymentId)
-      .query(`SELECT lp.*, l.group_id, l.balance AS loanBalance
-              FROM LoanPayments lp
-              JOIN Loans l ON l.loan_id = lp.loan_id
-              WHERE lp.payment_id = @paymentId`)
-
-    if (payResult.recordset.length === 0)
+    const payResult = await pool.query(
+      `SELECT lp.*, l.group_id, l.balance AS "loanBalance"
+       FROM loan_payments lp
+       JOIN loans l ON l.loan_id = lp.loan_id
+       WHERE lp.payment_id = $1`,
+      [paymentId]
+    )
+    if (payResult.rows.length === 0)
       return res.status(404).json({ message: 'Payment not found.' })
 
-    const payment = payResult.recordset[0]
+    const payment = payResult.rows[0]
     if (payment.group_id !== req.user.groupId)
       return res.status(403).json({ message: 'Not authorised.' })
     if (payment.status !== 'pending')
       return res.status(400).json({ message: `Payment already ${payment.status}.` })
 
-    // Check double-approval by same signatory
-    const alreadyApproved = await pool.request()
-      .input('paymentId',   sql.Int, paymentId)
-      .input('signatoryId', sql.Int, req.user.id)
-      .query(`SELECT approval_id FROM Approvals
-              WHERE entity_type='loan_payment' AND entity_id=@paymentId AND signatory_id=@signatoryId`)
-    if (alreadyApproved.recordset.length > 0)
+    const alreadyApproved = await pool.query(
+      `SELECT approval_id FROM approvals
+       WHERE entity_type='loan_payment' AND entity_id=$1 AND signatory_id=$2`,
+      [paymentId, req.user.id]
+    )
+    if (alreadyApproved.rows.length > 0)
       return res.status(400).json({ message: 'You have already approved this payment.' })
 
-    await pool.request()
-      .input('paymentId',   sql.Int, paymentId)
-      .input('signatoryId', sql.Int, req.user.id)
-      .query(`INSERT INTO Approvals (entity_type, entity_id, signatory_id)
-              VALUES ('loan_payment', @paymentId, @signatoryId)`)
+    await pool.query(
+      `INSERT INTO approvals (entity_type, entity_id, signatory_id)
+       VALUES ('loan_payment', $1, $2)`,
+      [paymentId, req.user.id]
+    )
 
-    const countResult = await pool.request()
-      .input('paymentId', sql.Int, paymentId)
-      .query(`SELECT COUNT(*) AS total FROM Approvals
-              WHERE entity_type='loan_payment' AND entity_id=@paymentId`)
-
-    const total = countResult.recordset[0].total
+    const countResult = await pool.query(
+      `SELECT COUNT(*) AS total FROM approvals
+       WHERE entity_type='loan_payment' AND entity_id=$1`,
+      [paymentId]
+    )
+    const total = parseInt(countResult.rows[0].total)
 
     if (total >= 2) {
-      // Mark payment approved and reduce loan balance
-      await pool.request()
-        .input('paymentId', sql.Int, paymentId)
-        .query(`UPDATE LoanPayments SET status='approved', approved_by=@signatoryId, approved_at=GETDATE()
-                WHERE payment_id=@paymentId`)
-        .input('signatoryId', sql.Int, req.user.id)
+      await pool.query(
+        `UPDATE loan_payments SET status='approved', approved_by=$1, approved_at=NOW()
+         WHERE payment_id=$2`,
+        [req.user.id, paymentId]
+      )
 
-      const newBalance = Math.max(0, payment.loanBalance - payment.amount)
+      const newBalance = Math.max(0, Number(payment.loanBalance) - Number(payment.amount))
       const loanStatus = newBalance <= 0 ? 'fully_paid' : 'approved'
 
-      await pool.request()
-        .input('loanId',     sql.Int,     payment.loan_id)
-        .input('newBalance', sql.Decimal, newBalance)
-        .input('status',     sql.NVarChar, loanStatus)
-        .query(`UPDATE Loans SET balance=@newBalance, status=@status WHERE loan_id=@loanId`)
+      await pool.query(
+        `UPDATE loans SET balance=$1, status=$2 WHERE loan_id=$3`,
+        [newBalance, loanStatus, payment.loan_id]
+      )
 
-      return res.json({
-        message: 'Payment approved. Loan balance updated.',
-        newBalance,
-        loanStatus,
-        approved: true,
-      })
+      return res.json({ message: 'Payment approved. Loan balance updated.', newBalance, loanStatus, approved: true })
     }
 
     res.json({ message: 'First payment approval recorded. Awaiting second signatory.', approvalCount: total })
@@ -301,30 +236,30 @@ const approvePayment = async (req, res, next) => {
   }
 }
 
-// PATCH /api/loans/payments/:paymentId/reject  (signatories only)
+// PATCH /api/loans/payments/:paymentId/reject
 const rejectPayment = async (req, res, next) => {
   try {
     const { paymentId } = req.params
-    const pool = await poolPromise
 
-    const existing = await pool.request()
-      .input('paymentId', sql.Int, paymentId)
-      .query(`SELECT lp.*, l.group_id FROM LoanPayments lp
-              JOIN Loans l ON l.loan_id = lp.loan_id
-              WHERE lp.payment_id = @paymentId`)
-
-    if (existing.recordset.length === 0)
+    const existing = await pool.query(
+      `SELECT lp.*, l.group_id FROM loan_payments lp
+       JOIN loans l ON l.loan_id = lp.loan_id
+       WHERE lp.payment_id = $1`,
+      [paymentId]
+    )
+    if (existing.rows.length === 0)
       return res.status(404).json({ message: 'Payment not found.' })
 
-    const pay = existing.recordset[0]
+    const pay = existing.rows[0]
     if (pay.group_id !== req.user.groupId)
       return res.status(403).json({ message: 'Not authorised.' })
     if (pay.status !== 'pending')
       return res.status(400).json({ message: 'Only pending payments can be rejected.' })
 
-    await pool.request()
-      .input('paymentId', sql.Int, paymentId)
-      .query(`UPDATE LoanPayments SET status='rejected' WHERE payment_id=@paymentId`)
+    await pool.query(
+      `UPDATE loan_payments SET status='rejected' WHERE payment_id=$1`,
+      [paymentId]
+    )
 
     res.json({ message: 'Payment rejected.' })
   } catch (err) {
@@ -332,20 +267,17 @@ const rejectPayment = async (req, res, next) => {
   }
 }
 
-// POST /api/loans/apply-interest  (signatories only) — apply monthly 20% to all active loans
+// POST /api/loans/apply-interest
 const applyMonthlyInterest = async (req, res, next) => {
   try {
-    const pool = await poolPromise
-    const result = await pool.request()
-      .input('groupId', sql.Int, req.user.groupId)
-      .query(`UPDATE Loans
-              SET balance = ROUND(balance * 1.20, 2)
-              WHERE group_id = @groupId
-                AND status = 'approved'
-                AND balance > 0
-              SELECT @@ROWCOUNT AS updated`)
+    const result = await pool.query(
+      `UPDATE loans
+       SET balance = ROUND(balance * 1.20, 2)
+       WHERE group_id = $1 AND status = 'approved' AND balance > 0`,
+      [req.user.groupId]
+    )
 
-    res.json({ message: 'Monthly interest applied.', loansUpdated: result.recordset[0]?.updated || 0 })
+    res.json({ message: 'Monthly interest applied.', loansUpdated: result.rowCount })
   } catch (err) {
     next(err)
   }
